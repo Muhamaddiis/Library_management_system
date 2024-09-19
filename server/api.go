@@ -4,10 +4,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+
 	"net/http"
+	"log"
 	"strconv"
+	"time"
 
 	"github.com/dgrijalva/jwt-go"
+	
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -31,18 +35,34 @@ type Book struct {
 	Availability bool   `json:"availability"`
 	Image        string `json:"image"`
 }
+type CreateUser struct {
+	Username string `json:"username"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	Role     string `json:"role"`
+}
 type User struct {
+	ID       int    `json:"id"`
 	Username string `json:"username"`
 	Email    string `json:"email"`
 	Password string `json:"password"`
 	Role     string `json:"role"`
 }
 
+type LoginResponse struct {
+	Token string `json:"token"`
+}
+
 type Claims struct {
 	UserID   int    `json:"user_id"`
 	Username string `json:"username"`
+	Role     string `json:"role"`
 	jwt.StandardClaims
 }
+
+
+
+var secretKey = []byte("scret_key")
 
 func NewApiserver(addr string) *ApiServer {
 	return &ApiServer{
@@ -53,13 +73,13 @@ func NewApiserver(addr string) *ApiServer {
 func (s *ApiServer) Run() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /books", getBooks)
-	mux.HandleFunc("POST /books", postBooks)
+	mux.Handle("POST /books", adminMiddleware(http.HandlerFunc(postBooks)))
 	mux.HandleFunc("DELETE /books/{id}", deleteBooks)
 	mux.HandleFunc("PUT /books/{id}", updateBooks)
 	mux.HandleFunc("POST /borrow/{id}", borrow)
 	mux.HandleFunc("POST /return/{id}", returning)
 	mux.HandleFunc("POST /signup", signUp)
-	// mux.HandleFunc("POST /login", login)
+	mux.HandleFunc("POST /login", login)
 	// mux.HandleFunc("PUT /", updateUserDetails)
 
 	srv := &http.Server{
@@ -107,6 +127,7 @@ func postBooks(w http.ResponseWriter, r *http.Request) {
 	query := `INSERT INTO books (title, author, genre, description, availability, image) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`
 	err = DB.QueryRow(query, newBook.Title, newBook.Author, newBook.Genre, newBook.Description, newBook.Availability, newBook.Image).Scan(&id)
 	if err != nil {
+		log.Printf("Database error: %v", err)
 		http.Error(w, "Failed to insert book", http.StatusInternalServerError)
 		return
 	}
@@ -136,6 +157,7 @@ func deleteBooks(w http.ResponseWriter, r *http.Request) {
 	query := `DELETE FROM books WHERE id = $1`
 	_, err = DB.Exec(query, id)
 	if err != nil {
+		log.Printf("Database error: %v", err)
 		http.Error(w, "Failed to delete book", http.StatusInternalServerError)
 		return
 	}
@@ -162,6 +184,7 @@ func updateBooks(w http.ResponseWriter, r *http.Request) {
         WHERE id = $7`
 	_, err = DB.Exec(query, updatedBook.Title, updatedBook.Author, updatedBook.Genre, updatedBook.Description, updatedBook.Availability, updatedBook.Image, id)
 	if err != nil {
+		log.Printf("Database error: %v", err)
 		http.Error(w, "Failed to Update", http.StatusInternalServerError)
 		return
 	}
@@ -171,7 +194,7 @@ func updateBooks(w http.ResponseWriter, r *http.Request) {
 
 // // User routes
 func signUp(w http.ResponseWriter, r *http.Request) {
-	var newUser User
+	var newUser CreateUser
 	err := json.NewDecoder(r.Body).Decode(&newUser)
 	if err != nil {
 		http.Error(w, "Invalid request body", http.StatusInternalServerError)
@@ -181,6 +204,7 @@ func signUp(w http.ResponseWriter, r *http.Request) {
 	query := `SELECT email FROM users WHERE email = $1`
 	err = DB.QueryRow(query, newUser.Email).Scan(&existingUser)
 	if err == nil {
+		log.Printf("Database error: %v", err)
 		http.Error(w, "Email already in use", http.StatusConflict) // 409 Conflict
 		return
 	} else if err != sql.ErrNoRows {
@@ -196,16 +220,52 @@ func signUp(w http.ResponseWriter, r *http.Request) {
 	query = `INSERT INTO users (username, email, password, role) VALUES ($1, $2, $3, $4)`
 	_, err = DB.Exec(query, newUser.Username, newUser.Email, hashedPassword, newUser.Role)
 	if err != nil {
+		log.Printf("Database error: %v", err)
 		http.Error(w, "Unable to Register User", http.StatusInternalServerError)
 		return
 	}
+
 	w.WriteHeader(http.StatusCreated)
 	w.Write([]byte("User created Successfully"))
 }
 
-// func login(w http.ResponseWriter, r *http.Request){
+func login(w http.ResponseWriter, r *http.Request) {
+	var loginUser CreateUser
+	// Parse te user request
+	err := json.NewDecoder(r.Body).Decode(&loginUser)
+	if err != nil {
+		http.Error(w, "Unable to parse json", http.StatusInternalServerError)
+		return
+	}
+	var dbUser User
+	// Check with the database
+	query := `SELECT id, username, password, role FROM users WHERE username = $1`
+	err = DB.QueryRow(query, loginUser.Username).Scan(&dbUser.ID, &dbUser.Username, &dbUser.Password, &dbUser.Role)
+	if err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			http.Error(w, "Invalid Username or Password", http.StatusUnauthorized)
+			return
+		}
+		log.Printf("Database error: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
 
-// }
+	err = bcrypt.CompareHashAndPassword([]byte(dbUser.Password), []byte(loginUser.Password))
+	if err != nil {
+		http.Error(w, "Invalid Username or Password", http.StatusUnauthorized)
+		return
+	}
+	// Create JWT Token
+	tokenStr, err := createToken(dbUser.ID, dbUser.Username, dbUser.Role)
+	if err != nil {
+		http.Error(w, "Failed to generate Token,", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(LoginResponse{Token: tokenStr})
+
+}
 
 // func updateUserDetails(w http.ResponseWriter, r *http.Request){
 
@@ -272,4 +332,45 @@ func returning(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Successfully returned book"))
+}
+
+func createToken(userID int, username, role string) (string, error) {
+	expirationTime := time.Now().Add(24 * time.Hour)
+	claims := &Claims{
+		UserID:   userID,
+		Username: username,
+		Role:     role,
+		StandardClaims: jwt.StandardClaims{
+			ExpiresAt: expirationTime.Unix(),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(secretKey)
+}
+
+
+func adminMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenString := r.Header.Get("Authorization")
+		if tokenString == ""{
+			http.Error(w, "Missing token", http.StatusUnauthorized)
+			return
+		}
+		claims := &Claims{}
+		token, err := jwt.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (interface{}, error) {
+			return secretKey, nil
+		})
+
+		if err != nil || !token.Valid {
+			http.Error(w, "invaild Token", http.StatusUnauthorized)
+			return
+		}
+
+		if claims.Role != "admin" {
+			http.Error(w, "Unautharized access", http.StatusForbidden)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
