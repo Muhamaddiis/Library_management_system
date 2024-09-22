@@ -4,14 +4,16 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 
-	"net/http"
 	"log"
+	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
-	
+	"github.com/joho/godotenv"
+
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -62,7 +64,9 @@ type Claims struct {
 
 
 
-var secretKey = []byte("scret_key")
+var secretKey []byte
+var expirationTime time.Time = time.Now().Add(24 * time.Hour)
+
 
 func NewApiserver(addr string) *ApiServer {
 	return &ApiServer{
@@ -71,16 +75,21 @@ func NewApiserver(addr string) *ApiServer {
 }
 
 func (s *ApiServer) Run() error {
+	err := godotenv.Load(".env")
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+	secretKey = []byte(os.Getenv("SECRET_KEY"))
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /books", getBooks)
-	mux.Handle("POST /books", adminMiddleware(http.HandlerFunc(postBooks)))
-	mux.HandleFunc("DELETE /books/{id}", deleteBooks)
-	mux.HandleFunc("PUT /books/{id}", updateBooks)
-	mux.HandleFunc("POST /borrow/{id}", borrow)
-	mux.HandleFunc("POST /return/{id}", returning)
+	mux.Handle("POST /books", jwtMiddleware(adminMiddleware(http.HandlerFunc(postBooks))))
+	mux.Handle("DELETE /books/{id}", jwtMiddleware(adminMiddleware(http.HandlerFunc(deleteBooks))))
+	mux.Handle("PUT /books/{id}", jwtMiddleware(adminMiddleware(http.HandlerFunc(updateBooks))))
+	mux.HandleFunc("POST /borrow/{id}", jwtMiddleware(http.HandlerFunc(borrow)))
+	mux.HandleFunc("POST /return/{id}", jwtMiddleware(http.HandlerFunc(returning)))
 	mux.HandleFunc("POST /signup", signUp)
 	mux.HandleFunc("POST /login", login)
-	// mux.HandleFunc("PUT /", updateUserDetails)
+	// mux.HandleFunc("PUT /update", updateUserDetails)
 
 	srv := &http.Server{
 		Handler: mux,
@@ -262,10 +271,53 @@ func login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to generate Token,", http.StatusInternalServerError)
 		return
 	}
+	cookie := http.Cookie {
+		Name: "token",
+		Value: tokenStr,
+		Expires: expirationTime,
+		HttpOnly: true,
+	}
+	http.SetCookie(w, &cookie)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(LoginResponse{Token: tokenStr})
 
 }
+
+func createToken(userID int, username, role string) (string, error) {
+	
+	claims := &Claims{
+		UserID:   userID,
+		Username: username,
+		Role:     role,
+		StandardClaims: jwt.StandardClaims{
+			ExpiresAt: expirationTime.Unix(),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(secretKey)
+}
+
+func extractUserIDFromCookie(r *http.Request) (int, error) {
+	cookies, err := r.Cookie("token")
+	if err != nil {
+		return 0, fmt.Errorf("no token Cookie")
+	}
+
+	tokenString := cookies.Value
+
+	claims := &Claims{}
+
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (interface{}, error) {
+		return secretKey, nil
+	})
+
+	if err != nil || !token.Valid {
+        return 0, fmt.Errorf("invalid token")
+    }
+
+    return claims.UserID, nil
+}
+
 
 // func updateUserDetails(w http.ResponseWriter, r *http.Request){
 
@@ -273,8 +325,15 @@ func login(w http.ResponseWriter, r *http.Request) {
 
 // // Borrowing and Returning routes
 func borrow(w http.ResponseWriter, r *http.Request) {
+
+	userID, err := extractUserIDFromCookie(r)
+    if err != nil {
+        http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
+        return
+    }
+
 	idStr := r.PathValue("id")
-	id, err := strconv.Atoi(idStr)
+	bookId, err := strconv.Atoi(idStr)
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -282,7 +341,7 @@ func borrow(w http.ResponseWriter, r *http.Request) {
 	// Check if the book is already borrowed
 	var availability bool
 	query := `SELECT availability FROM books WHERE id = $1`
-	err = DB.QueryRow(query, id).Scan(&availability)
+	err = DB.QueryRow(query, bookId).Scan(&availability)
 	if err != nil {
 		http.Error(w, "Failed to check book availability", http.StatusInternalServerError)
 		return
@@ -294,14 +353,27 @@ func borrow(w http.ResponseWriter, r *http.Request) {
 
 	// Update availability to false
 	query = `UPDATE books SET availability = false WHERE id = $1`
-	_, err = DB.Exec(query, id)
+	_, err = DB.Exec(query, bookId)
 	if err != nil {
 		http.Error(w, "Failed to borrow book", http.StatusInternalServerError)
+		return
+	}
+	// Insert into the borrowings table
+	borrowDate := time.Now()
+	dueDate := borrowDate.AddDate(0, 0, 14)
+	renewed := false
+	query = `INSERT INTO borrowings (user_id, book_id, borrow_date, due_date, renewed) VALUES ($1, $2, $3, $4, $5)`
+	_, err = DB.Exec(query, userID, bookId, borrowDate, dueDate, renewed)
+	if err != nil {
+		log.Printf("Database error: %v", err)
+		http.Error(w, "Failed to update borrowings", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Successfully borrowed book"))
 }
+
+
 
 func returning(w http.ResponseWriter, r *http.Request) {
 	idStr := r.PathValue("id")
@@ -310,6 +382,7 @@ func returning(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	
 	var availability bool
 	query := `SELECT availability FROM books WHERE id = $1`
 	err = DB.QueryRow(query, id).Scan(&availability)
@@ -330,47 +403,16 @@ func returning(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	returnDate := time.Now().Format("2006-01-02")
+
+	query = `UPDATE borrowings SET return_date = $1 WHERE book_id = $2`
+	_, err = DB.Exec(query, returnDate, id)
+	if err != nil {
+	log.Printf("failed to update return date %v", err)
+	http.Error(w, "Failed to update the return Date", http.StatusInternalServerError)
+	return
+}
+
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Successfully returned book"))
-}
-
-func createToken(userID int, username, role string) (string, error) {
-	expirationTime := time.Now().Add(24 * time.Hour)
-	claims := &Claims{
-		UserID:   userID,
-		Username: username,
-		Role:     role,
-		StandardClaims: jwt.StandardClaims{
-			ExpiresAt: expirationTime.Unix(),
-		},
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(secretKey)
-}
-
-
-func adminMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tokenString := r.Header.Get("Authorization")
-		if tokenString == ""{
-			http.Error(w, "Missing token", http.StatusUnauthorized)
-			return
-		}
-		claims := &Claims{}
-		token, err := jwt.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (interface{}, error) {
-			return secretKey, nil
-		})
-
-		if err != nil || !token.Valid {
-			http.Error(w, "invaild Token", http.StatusUnauthorized)
-			return
-		}
-
-		if claims.Role != "admin" {
-			http.Error(w, "Unautharized access", http.StatusForbidden)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
 }
