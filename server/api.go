@@ -85,10 +85,11 @@ func (s *ApiServer) Run() error {
 	mux.Handle("POST /books", jwtMiddleware(adminMiddleware(http.HandlerFunc(postBooks))))
 	mux.Handle("DELETE /books/{id}", jwtMiddleware(adminMiddleware(http.HandlerFunc(deleteBooks))))
 	mux.Handle("PUT /books/{id}", jwtMiddleware(adminMiddleware(http.HandlerFunc(updateBooks))))
-	mux.HandleFunc("POST /borrow/{id}", jwtMiddleware(http.HandlerFunc(borrow)))
-	mux.HandleFunc("POST /return/{id}", jwtMiddleware(http.HandlerFunc(returning)))
+	mux.Handle("POST /borrow/{id}", jwtMiddleware(http.HandlerFunc(borrow)))
+	mux.Handle("POST /return/{id}", jwtMiddleware(http.HandlerFunc(returning)))
 	mux.HandleFunc("POST /signup", signUp)
 	mux.HandleFunc("POST /login", login)
+	mux.HandleFunc("GET /users", getUsers)
 	// mux.HandleFunc("PUT /update", updateUserDetails)
 
 	srv := &http.Server{
@@ -240,7 +241,7 @@ func signUp(w http.ResponseWriter, r *http.Request) {
 
 func login(w http.ResponseWriter, r *http.Request) {
 	var loginUser CreateUser
-	// Parse te user request
+	// Parse the user request
 	err := json.NewDecoder(r.Body).Decode(&loginUser)
 	if err != nil {
 		http.Error(w, "Unable to parse json", http.StatusInternalServerError)
@@ -281,6 +282,32 @@ func login(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(LoginResponse{Token: tokenStr})
 
+}
+
+func getUsers(w http.ResponseWriter, r *http.Request) {
+	var users[] User
+	query := `SELECT id, email, username, role from users`
+	rows, err := DB.Query(query)
+	if err != nil {
+		http.Error(w, "Unable to query user table", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var user User
+		if err := rows.Scan(&user.ID, &user.Username, &user.Email, &user.Role); err != nil {
+			http.Error(w, "Unable to scan the user rows", http.StatusInternalServerError)
+			return
+		}
+		users = append(users, user)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(users); err != nil {
+		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
+		return
+	}
 }
 
 func createToken(userID int, username, role string) (string, error) {
@@ -325,59 +352,67 @@ func extractUserIDFromCookie(r *http.Request) (int, error) {
 
 // // Borrowing and Returning routes
 func borrow(w http.ResponseWriter, r *http.Request) {
-
-	userID, err := extractUserIDFromCookie(r)
+    // Extract user ID from cookie
+    userID, err := extractUserIDFromCookie(r)
     if err != nil {
         http.Error(w, "Unauthorized: "+err.Error(), http.StatusUnauthorized)
         return
     }
 
-	idStr := r.PathValue("id")
-	bookId, err := strconv.Atoi(idStr)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	// Check if the book is already borrowed
-	var availability bool
-	query := `SELECT availability FROM books WHERE id = $1`
-	err = DB.QueryRow(query, bookId).Scan(&availability)
-	if err != nil {
-		http.Error(w, "Failed to check book availability", http.StatusInternalServerError)
-		return
-	}
-	if !availability {
-		http.Error(w, "Book is already borrowed", http.StatusBadRequest)
-		return
-	}
+    // Parse book ID from request path
+    idStr := r.PathValue("id") // Assuming r.PathValue is a custom method to extract path variables
+    bookId, err := strconv.Atoi(idStr)
+    if err != nil {
+        http.Error(w, "Invalid book ID", http.StatusBadRequest)
+        return
+    }
 
-	// Update availability to false
-	query = `UPDATE books SET availability = false WHERE id = $1`
-	_, err = DB.Exec(query, bookId)
-	if err != nil {
-		http.Error(w, "Failed to borrow book", http.StatusInternalServerError)
-		return
-	}
-	// Insert into the borrowings table
-	borrowDate := time.Now()
-	dueDate := borrowDate.AddDate(0, 0, 14)
-	renewed := false
-	query = `INSERT INTO borrowings (user_id, book_id, borrow_date, due_date, renewed) VALUES ($1, $2, $3, $4, $5)`
-	_, err = DB.Exec(query, userID, bookId, borrowDate, dueDate, renewed)
-	if err != nil {
-		log.Printf("Database error: %v", err)
-		http.Error(w, "Failed to update borrowings", http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Successfully borrowed book"))
+    // Check if the book is available
+    var availability bool
+    query := `SELECT availability FROM books WHERE id = $1`
+    err = DB.QueryRow(query, bookId).Scan(&availability)
+    if err != nil {
+        log.Printf("Error checking book availability: %v", err)
+        http.Error(w, "Failed to check book availability", http.StatusInternalServerError)
+        return
+    }
+    if !availability {
+        http.Error(w, "Book is already borrowed", http.StatusBadRequest)
+        return
+    }
+
+    // Update book availability
+    query = `UPDATE books SET availability = false WHERE id = $1`
+    _, err = DB.Exec(query, bookId)
+    if err != nil {
+        log.Printf("Error updating book availability: %v", err)
+        http.Error(w, "Failed to borrow book", http.StatusInternalServerError)
+        return
+    }
+
+    // Insert borrowing record
+    borrowDate := time.Now()
+    dueDate := borrowDate.AddDate(0, 0, 14) // Default borrow duration is 14 days
+    renewed := false
+    query = `INSERT INTO borrowings (user_id, book_id, borrow_date, due_date, renewed) VALUES ($1, $2, $3, $4, $5)`
+    _, err = DB.Exec(query, userID, bookId, borrowDate, dueDate, renewed)
+    if err != nil {
+        log.Printf("Error inserting borrowing record: %v", err)
+        http.Error(w, "Failed to update borrowings", http.StatusInternalServerError)
+        return
+    }
+
+    // Respond with success
+    w.WriteHeader(http.StatusOK)
+    w.Write([]byte("Successfully borrowed book"))
 }
+
 
 
 
 func returning(w http.ResponseWriter, r *http.Request) {
 	idStr := r.PathValue("id")
-	id, err := strconv.Atoi(idStr)
+	bookId, err := strconv.Atoi(idStr)
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -385,7 +420,7 @@ func returning(w http.ResponseWriter, r *http.Request) {
 	
 	var availability bool
 	query := `SELECT availability FROM books WHERE id = $1`
-	err = DB.QueryRow(query, id).Scan(&availability)
+	err = DB.QueryRow(query, bookId).Scan(&availability)
 	if err != nil {
 		http.Error(w, "Failed to check book availability", http.StatusInternalServerError)
 		return
@@ -395,18 +430,46 @@ func returning(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Retrieve the due date and user ID for the book borrowing
+    var userID int
+    var dueDate time.Time
+    query = `SELECT user_id, due_date FROM borrowings WHERE book_id = $1 AND return_date IS NULL`
+    err = DB.QueryRow(query, bookId).Scan(&userID, &dueDate)
+    if err != nil {
+        http.Error(w, "Failed to retrieve borrowing details", http.StatusInternalServerError)
+        return
+    }
+
+    // Check if the book is overdue
+    returnDate := time.Now()
+    if returnDate.After(dueDate) {
+        // Calculate the number of days overdue
+        daysOverdue := int(returnDate.Sub(dueDate).Hours() / 24)
+        fineAmount := float64(daysOverdue * 5) // Example: $5 per day overdue
+
+        // Insert fine record into the fines table
+        query = `INSERT INTO fines (user_id, book_id, fine_amount, fine_date) VALUES ($1, $2, $3, $4)`
+        _, err = DB.Exec(query, userID, bookId, fineAmount, returnDate.Format("2006-01-02"))
+        if err != nil {
+            log.Printf("Database error: %v", err)
+            http.Error(w, "Failed to create fine", http.StatusInternalServerError)
+            return
+        }
+    }
+	
+
 	// Update availability to true
 	query = `UPDATE books SET availability = true WHERE id = $1`
-	_, err = DB.Exec(query, id)
+	_, err = DB.Exec(query, bookId)
 	if err != nil {
 		http.Error(w, "Failed to return book", http.StatusInternalServerError)
 		return
 	}
 
-	returnDate := time.Now().Format("2006-01-02")
+	
 
 	query = `UPDATE borrowings SET return_date = $1 WHERE book_id = $2`
-	_, err = DB.Exec(query, returnDate, id)
+	_, err = DB.Exec(query, returnDate, bookId)
 	if err != nil {
 	log.Printf("failed to update return date %v", err)
 	http.Error(w, "Failed to update the return Date", http.StatusInternalServerError)

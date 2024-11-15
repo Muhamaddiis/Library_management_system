@@ -44,6 +44,7 @@ func jwtMiddleware(next http.Handler) http.HandlerFunc {
 		})
 		if err != nil || !token.Valid {
 			http.Error(w, "Invalid Token", http.StatusUnauthorized)
+			return
 		}
 		next.ServeHTTP(w, r)
 	}
