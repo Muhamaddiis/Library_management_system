@@ -1,7 +1,7 @@
 import React from 'react'
 import { FiArrowUpRight, FiDollarSign, FiMoreHorizontal } from 'react-icons/fi'
 
-interface Fine {
+export interface Fine {
   user_id: string;
   book_id: string;
   fine_amount: number;

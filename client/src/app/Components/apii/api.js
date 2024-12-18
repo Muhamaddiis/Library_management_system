@@ -11,7 +11,12 @@ const fetchData = async (endpoint, options = {}) => {
     console.log(response);
     
     return response.json();
-  };
+};
+  
+
+
+
+
   
   export const fetchBooks = () => fetchData("/books");
   export const fetchUsers = () => fetchData("/users");
