@@ -12,7 +12,16 @@ const fetchData = async (endpoint, options = {}) => {
     
     return response.json();
 };
-  
+
+export const deleteBook = (id) => fetchData(`/books/${id}`, { method: "DELETE" });
+
+export const updateBook = (id, data) => fetchData(`/books/${id}`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(data),
+  });
 
 
 

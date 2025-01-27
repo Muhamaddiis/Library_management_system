@@ -1,5 +1,5 @@
 export interface Book {
-    id: number;
+    ID: number;
     title: string;
     author: string;
     genre: string;
@@ -9,10 +9,14 @@ export interface Book {
     
 }
 
+
+
 export interface User {
     id: number;
-    name: string;
-}
+    username: string;
+    email: string;
+    role: 'admin' | 'user';
+  }
 
 export interface Fine {
     id: number;
@@ -20,6 +24,7 @@ export interface Fine {
     book_id: number;
     fine_amount: number;
     fine_date: string;
+    status: "Paid" | "Unpaid"
 }
   
 export interface Borrowing {

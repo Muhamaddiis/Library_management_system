@@ -9,7 +9,13 @@ import { fetchBooks, fetchBorrowings, fetchFines, fetchUsers } from "../apii/api
 
 const Grid = () => {
   const [stats, setStats] = useState<StatCard[]>([]);
-  const [fines, setFines] = useState<{ fine_amount?: number }[]>([]);
+  interface Fine {
+    fine_amount: number;
+    user_id: number;
+    book_id: number;
+    fine_date: string;
+  }
+  const [fines, setFines] = useState<Fine[]>([]);
 
   useEffect(() => {
     const loadData = async () => {
@@ -22,8 +28,7 @@ const Grid = () => {
         ]);
   
         setFines(finesData);
-        const totalFines = fines.reduce((sum: number, fine: { fine_amount?: number }) => sum + (fine.fine_amount || 0), 0);
-
+        const totalFines = finesData.reduce((sum: number, fine: { fine_amount?: number }) => sum + (fine.fine_amount || 0), 0);
 
         setStats([
           { title: "Users", value: users.length, pilltext: "2.75%", trend: "Up", period: "17th August 2024" },
