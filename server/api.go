@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -69,16 +70,17 @@ type Fines struct {
 	BookID   int     `json:"book_id"`
 	FineAmt  float64 `json:"fine_amount"`
 	FineDate string  `json:"fine_date"`
+	Status   string  `json:"status"`
 }
 
 type Borrowings struct {
-	ID         int    `json:"id"`
-	UserId     int    `json:"user_id"`
-	BookId     int    `json:"book_id"`
-	BorrowDate string `json:"borrow_date"`
+	ID         int     `json:"id"`
+	UserId     int     `json:"user_id"`
+	BookId     int     `json:"book_id"`
+	BorrowDate string  `json:"borrow_date"`
 	ReturnDate *string `json:"return_date"`
-	DueDate    string `json:"due_date"`
-	Renewed    bool   `json:"renewed"`
+	DueDate    string  `json:"due_date"`
+	Renewed    bool    `json:"renewed"`
 }
 
 var secretKey []byte
@@ -98,20 +100,25 @@ func (s *ApiServer) Run() error {
 	secretKey = []byte(os.Getenv("SECRET_KEY"))
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /books", getBooks)
-	mux.Handle("POST /books", jwtMiddleware(adminMiddleware(http.HandlerFunc(postBooks))))
-	mux.Handle("DELETE /books/{id}", jwtMiddleware(adminMiddleware(http.HandlerFunc(deleteBooks))))
-	mux.Handle("PUT /books/{id}", jwtMiddleware(adminMiddleware(http.HandlerFunc(updateBooks))))
+	mux.HandleFunc("GET /books/{id}", getBookById)
+	mux.HandleFunc("POST /books", postBooks)
+	mux.HandleFunc("DELETE /books/{id}", deleteBooks)
+	mux.HandleFunc("PUT /books/{id}", updateBooks)
 	mux.Handle("POST /borrow/{id}", jwtMiddleware(http.HandlerFunc(borrow)))
 	mux.Handle("POST /return/{id}", jwtMiddleware(http.HandlerFunc(returning)))
 	mux.HandleFunc("POST /signup", signUp)
 	mux.HandleFunc("POST /login", login)
+	mux.Handle("GET /me", jwtMiddleware(http.HandlerFunc(meHandler)))
 	mux.HandleFunc("GET /users", getUsers)
+	mux.HandleFunc("GET /users/{id}", getUsersbyId)
 	mux.HandleFunc("GET /fines", getFines)
+	mux.HandleFunc("GET /fines/{id}", getFinesUserId)
+	mux.HandleFunc("PATCH /fines/{id}", updateFinePayment)
 	mux.HandleFunc("GET /borrowings", borrowings)
-	// mux.HandleFunc("PUT /update", updateUserDetails)
+	mux.HandleFunc("PUT /updateUser/{id}", updateUserDetails)
 	corsMiddleware := cors.New(cors.Options{
 		AllowedOrigins:   []string{"http://localhost:3000"}, // Replace with your frontend URL
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"},
 		AllowedHeaders:   []string{"Content-Type", "Authorization"},
 		AllowCredentials: true,
 	})
@@ -149,6 +156,26 @@ func getBooks(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(books)
+}
+
+func getBookById(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil || id < 0 {
+		http.NotFound(w, r)
+		return
+	}
+	var book Book
+	query := `SELECT * FROM books WHERE id = $1`
+	err = DB.QueryRow(query, id).Scan(&book.ID, &book.Title, &book.Author, &book.Genre, &book.Description, &book.Availability, &book.Image)
+	if err != nil {
+		http.Error(w, "Failed to fetch book", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(book)
 }
 
 func postBooks(w http.ResponseWriter, r *http.Request) {
@@ -230,84 +257,112 @@ func updateBooks(w http.ResponseWriter, r *http.Request) {
 
 // // User routes
 func signUp(w http.ResponseWriter, r *http.Request) {
+	// Create a context with a timeout (e.g., 5 seconds)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel() // Always call cancel to release resources
+
 	var newUser CreateUser
 	err := json.NewDecoder(r.Body).Decode(&newUser)
 	if err != nil {
-		http.Error(w, "Invalid request body", http.StatusInternalServerError)
+		http.Error(w, "Invalid request body", http.StatusBadRequest) // 400 Bad Request
 		return
 	}
+	if newUser.Role == "" {
+		newUser.Role = "user"
+	}
+	// Check if the email already exists
 	var existingUser string
 	query := `SELECT email FROM users WHERE email = $1`
-	err = DB.QueryRow(query, newUser.Email).Scan(&existingUser)
+	err = DB.QueryRowContext(ctx, query, newUser.Email).Scan(&existingUser)
 	if err == nil {
-		log.Printf("Database error: %v", err)
 		http.Error(w, "Email already in use", http.StatusConflict) // 409 Conflict
 		return
 	} else if err != sql.ErrNoRows {
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		log.Printf("Database error: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError) // 500 Internal Server Error
 		return
 	}
 
+	// Hash the password
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(newUser.Password), bcrypt.DefaultCost)
 	if err != nil {
-		http.Error(w, "Failed to hash the password", http.StatusInternalServerError)
-		return
-	}
-	query = `INSERT INTO users (username, email, password, role) VALUES ($1, $2, $3, $4)`
-	_, err = DB.Exec(query, newUser.Username, newUser.Email, hashedPassword, newUser.Role)
-	if err != nil {
-		log.Printf("Database error: %v", err)
-		http.Error(w, "Unable to Register User", http.StatusInternalServerError)
+		log.Printf("Failed to hash password: %v", err)
+		http.Error(w, "Failed to hash the password", http.StatusInternalServerError) // 500 Internal Server Error
 		return
 	}
 
-	w.WriteHeader(http.StatusCreated)
-	w.Write([]byte("User created Successfully"))
+	// Insert the new user into the database
+	query = `INSERT INTO users (username, email, password, role) VALUES ($1, $2, $3, $4)`
+	_, err = DB.ExecContext(ctx, query, newUser.Username, newUser.Email, hashedPassword, newUser.Role)
+	if err != nil {
+		log.Printf("Database error: %v", err)
+		http.Error(w, "Unable to register user", http.StatusInternalServerError) // 500 Internal Server Error
+		return
+	}
+
+	// Respond with success message
+	w.WriteHeader(http.StatusCreated) // 201 Created
+	w.Write([]byte("User created successfully"))
 }
 
 func login(w http.ResponseWriter, r *http.Request) {
-	var loginUser CreateUser
+	// Create a context with a timeout (e.g., 5 seconds)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel() // Always call cancel to release resources
+
 	// Parse the user request
+	var loginUser CreateUser
 	err := json.NewDecoder(r.Body).Decode(&loginUser)
 	if err != nil {
-		http.Error(w, "Unable to parse json", http.StatusInternalServerError)
-		return
-	}
-	var dbUser User
-	// Check with the database
-	query := `SELECT id, username, password, role FROM users WHERE username = $1`
-	err = DB.QueryRow(query, loginUser.Username).Scan(&dbUser.ID, &dbUser.Username, &dbUser.Password, &dbUser.Role)
-	if err != nil {
-		if err.Error() == "sql: no rows in result set" {
-			http.Error(w, "Invalid Username or Password", http.StatusUnauthorized)
-			return
-		}
-		log.Printf("Database error: %v", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		http.Error(w, "Unable to parse JSON", http.StatusBadRequest) // 400 Bad Request
 		return
 	}
 
-	err = bcrypt.CompareHashAndPassword([]byte(dbUser.Password), []byte(loginUser.Password))
+	// Check if the username exists in the database
+	var dbUser User
+	query := `SELECT id, username, password, role FROM users WHERE username = $1`
+	err = DB.QueryRowContext(ctx, query, loginUser.Username).Scan(&dbUser.ID, &dbUser.Username, &dbUser.Password, &dbUser.Role)
 	if err != nil {
-		http.Error(w, "Invalid Username or Password", http.StatusUnauthorized)
+		if err == sql.ErrNoRows {
+			http.Error(w, "Invalid Username or Password", http.StatusUnauthorized) // 401 Unauthorized
+			return
+		}
+		log.Printf("Database error: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError) // 500 Internal Server Error
 		return
 	}
+
+	// Compare the provided password with the hashed password in the database
+	err = bcrypt.CompareHashAndPassword([]byte(dbUser.Password), []byte(loginUser.Password))
+	if err != nil {
+		http.Error(w, "Invalid Username or Password", http.StatusUnauthorized) // 401 Unauthorized
+		return
+	}
+
 	// Create JWT Token
 	tokenStr, err := createToken(dbUser.ID, dbUser.Username, dbUser.Role)
 	if err != nil {
-		http.Error(w, "Failed to generate Token,", http.StatusInternalServerError)
+		log.Printf("Failed to generate token: %v", err)
+		http.Error(w, "Failed to generate token", http.StatusInternalServerError) // 500 Internal Server Error
 		return
 	}
+
+	// Set the token in a cookie
+	expirationTime := time.Now().Add(24 * time.Hour) // Token expires in 24 hours
 	cookie := http.Cookie{
 		Name:     "token",
 		Value:    tokenStr,
 		Expires:  expirationTime,
 		HttpOnly: true,
+		Secure:   false, // ❗ MUST be false on localhost
+		SameSite: http.SameSiteLaxMode, // Use Lax for GET requests like /me
 	}
 	http.SetCookie(w, &cookie)
+	
+
+	// Respond with the token in JSON format
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(LoginResponse{Token: tokenStr})
-
 }
 
 func getUsers(w http.ResponseWriter, r *http.Request) {
@@ -322,7 +377,7 @@ func getUsers(w http.ResponseWriter, r *http.Request) {
 
 	for rows.Next() {
 		var user User
-		if err := rows.Scan(&user.ID, &user.Username, &user.Email, &user.Role); err != nil {
+		if err := rows.Scan(&user.ID, &user.Email, &user.Username, &user.Role); err != nil {
 			http.Error(w, "Unable to scan the user rows", http.StatusInternalServerError)
 			return
 		}
@@ -334,6 +389,67 @@ func getUsers(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
 		return
 	}
+}
+func getUsersbyId(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	if idStr == "" {
+		log.Println("Missing ID in URL")
+		http.Error(w, `{"error": "Missing user ID"}`, http.StatusBadRequest)
+		return
+	}
+
+	id, err := strconv.Atoi(idStr)
+	if err != nil || id <= 0 {
+		log.Printf("Invalid ID: %v", err)
+		http.Error(w, `{"error": "Invalid user ID"}`, http.StatusBadRequest)
+		return
+	}
+
+	var user User
+	query := `SELECT id, email, username, role FROM users WHERE id = $1`
+	log.Printf("Executing query: %s with ID: %d", query, id)
+
+	err = DB.QueryRow(query, id).Scan(&user.ID, &user.Email, &user.Username, &user.Role)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Printf("User not found with ID: %d", id)
+			http.Error(w, `{"error": "User not found"}`, http.StatusNotFound)
+		} else {
+			log.Printf("Database error: %v", err)
+			http.Error(w, `{"error": "Failed to fetch user"}`, http.StatusInternalServerError)
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(user)
+}
+
+func meHandler(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie("token")
+	if err != nil {
+		http.Error(w, "Missing token", http.StatusUnauthorized)
+		return
+	}
+
+	claims := &Claims{}
+	tokenStr := cookie.Value
+	token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
+		return secretKey, nil
+	})
+
+	if err != nil || !token.Valid {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"user_id":  claims.UserID,
+		"username": claims.Username,
+		"role":     claims.Role,
+	})
 }
 
 func createToken(userID int, username, role string) (string, error) {
@@ -371,9 +487,39 @@ func extractUserIDFromCookie(r *http.Request) (int, error) {
 	return claims.UserID, nil
 }
 
-// func updateUserDetails(w http.ResponseWriter, r *http.Request){
+func updateUserDetails(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil || id <= 0 {
+		http.Error(w, `{"error": "Invalid user ID"}`, http.StatusBadRequest)
+		return
+	}
 
-// }
+	var updatedUser User
+	if err := json.NewDecoder(r.Body).Decode(&updatedUser); err != nil {
+		http.Error(w, `{"error": "Invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Validate role
+	if updatedUser.Role != "admin" && updatedUser.Role != "user" {
+		http.Error(w, `{"error": "Invalid role"}`, http.StatusBadRequest)
+		return
+	}
+
+	query := `UPDATE users SET email = $1, username = $2, role = $3 WHERE id = $4 RETURNING id, email, username, role`
+	var user User
+	err = DB.QueryRow(query, updatedUser.Email, updatedUser.Username, updatedUser.Role, id).Scan(&user.ID, &user.Email, &user.Username, &user.Role)
+	if err != nil {
+		log.Printf("Database error: %v", err)
+		http.Error(w, `{"error": "Failed to update user"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(user)
+}
 
 // // Borrowing and Returning routes
 func borrow(w http.ResponseWriter, r *http.Request) {
@@ -511,7 +657,7 @@ func getFines(w http.ResponseWriter, r *http.Request) {
 
 	for rows.Next() {
 		var fine Fines
-		if err := rows.Scan(&fine.ID, &fine.UserID, &fine.BookID, &fine.FineAmt, &fine.FineDate); err != nil {
+		if err := rows.Scan(&fine.ID, &fine.UserID, &fine.BookID, &fine.FineAmt, &fine.FineDate, &fine.Status); err != nil {
 			http.Error(w, "Unable to Scan Fines", http.StatusInternalServerError)
 			return
 		}
@@ -520,6 +666,78 @@ func getFines(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(fines)
+}
+
+func getFinesUserId(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		http.Error(w, "Invalid User ID", http.StatusBadRequest)
+		return
+	}
+
+	var fines []Fines
+	query := `SELECT * FROM fines WHERE user_id = $1`
+	rows, err := DB.Query(query, id)
+	if err != nil {
+		http.Error(w, "Failed to query fines", http.StatusInternalServerError)
+		log.Printf("Error querying fines: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var fine Fines
+		if err := rows.Scan(&fine.ID, &fine.UserID, &fine.BookID, &fine.FineAmt, &fine.FineDate, &fine.Status); err != nil {
+			http.Error(w, "Failed to scan fines", http.StatusInternalServerError)
+			return
+		}
+		fines = append(fines, fine)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(fines)
+}
+
+func updateFinePayment(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		log.Printf("Invalid User ID: %s", idStr)
+		http.Error(w, "Invalid User ID", http.StatusBadRequest)
+		return
+	}
+
+	var fine Fines
+	if err := json.NewDecoder(r.Body).Decode(&fine); err != nil {
+		log.Printf("Invalid request body: %v", err)
+		http.Error(w, `{"error": "Invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Updating fine: ID=%d, Status=%s", id, fine.Status)
+	if fine.Status != "Paid" && fine.Status != "Unpaid" {
+		log.Printf("Invalid status: %s", fine.Status)
+		http.Error(w, `{"error": "Invalid status. Allowed values: Paid, Unpaid"}`, http.StatusBadRequest)
+		return
+	}
+
+	query := `UPDATE fines SET status = $1 WHERE id = $2 RETURNING id, user_id, book_id, fine_amount, fine_date, status`
+	err = DB.QueryRow(query, fine.Status, id).Scan(&fine.ID, &fine.UserID, &fine.BookID, &fine.FineAmt, &fine.FineDate, &fine.Status)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Printf("No fine found for User ID: %d", id)
+			http.Error(w, `{"error": "Fine not found"}`, http.StatusNotFound)
+		} else {
+			log.Printf("Failed to update fine status: %v", err)
+			http.Error(w, `{"error": "Failed to update fine status"}`, http.StatusInternalServerError)
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(fine)
 }
 
 func borrowings(w http.ResponseWriter, r *http.Request) {
