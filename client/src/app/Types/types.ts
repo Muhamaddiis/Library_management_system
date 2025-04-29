@@ -9,7 +9,20 @@ export interface Book {
     
 }
 
-
+export interface TestBook {
+    id: string,
+    title: string,
+    author: string,
+    genre: string,
+    rating: number,
+    total_copies: number,
+    available_copies: number,
+    description: string,
+    color: string,
+    coverUrl: string,
+    summary: string
+    isLoanedBook?: boolean
+}
 
 export interface User {
     id: number;
