@@ -1,6 +1,6 @@
 import React from 'react'
-import Sidebar from '../Components/Sidebar/Sidebar'
-import BookData from '../Components/BookData/BookData'
+import Sidebar from '../../Components/Sidebar/Sidebar'
+import BookData from '../../Components/BookData/BookData'
 
 
 const page = () => {

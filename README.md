@@ -5,6 +5,9 @@ The system supports user authentication, book management, borrowing/returning bo
 Authentication is handled using **JWT tokens stored in cookies**.
 
 ---
+![Homepage](./Assets/Home.png)
+![Library Dashboard](./Assets/Dashboard.png)
+
 
 ## 🚀 Features
 

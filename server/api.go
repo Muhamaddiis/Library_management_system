@@ -64,6 +64,12 @@ type Claims struct {
 	jwt.StandardClaims
 }
 
+type UserProfile struct {
+	User     User           `json:"user"`
+	Books    []BorrowedBook `json:"borrowed_books"`
+	Fines    []UserFine     `json:"unpaid_fines"`
+}
+
 type Fines struct {
 	ID       int     `json:"id"`
 	UserID   int     `json:"user_id"`
@@ -81,6 +87,25 @@ type Borrowings struct {
 	ReturnDate *string `json:"return_date"`
 	DueDate    string  `json:"due_date"`
 	Renewed    bool    `json:"renewed"`
+}
+
+type BorrowedBook struct {
+	ID          int       `json:"id"`
+	Title       string    `json:"title"`
+	Author      string    `json:"author"`
+	Image       string    `json:"image"`
+	BorrowDate  time.Time `json:"borrow_date"`
+	DueDate     time.Time `json:"due_date"`
+	Renewed     bool      `json:"renewed"`
+}
+
+type UserFine struct {
+	ID        int     `json:"id"`
+	BookTitle string  `json:"book_title"`
+	Amount    float64 `json:"amount"`
+	Date      string  `json:"date"`
+	Status    string  `json:"status"`
+	
 }
 
 var secretKey []byte
@@ -113,9 +138,13 @@ func (s *ApiServer) Run() error {
 	mux.HandleFunc("GET /users/{id}", getUsersbyId)
 	mux.HandleFunc("GET /fines", getFines)
 	mux.HandleFunc("GET /fines/{id}", getFinesUserId)
+	mux.Handle("GET /profile", jwtMiddleware(http.HandlerFunc(getUserProfile)))
 	mux.HandleFunc("PATCH /fines/{id}", updateFinePayment)
 	mux.HandleFunc("GET /borrowings", borrowings)
 	mux.HandleFunc("PUT /updateUser/{id}", updateUserDetails)
+	mux.Handle("GET /profile/books", jwtMiddleware(http.HandlerFunc(getUserBorrowedBooks)))
+	mux.Handle("GET /profile/fines", jwtMiddleware(http.HandlerFunc(getUserFines)))
+	mux.Handle("POST /profile/renew/{id}", jwtMiddleware(http.HandlerFunc(renewBook)))
 	corsMiddleware := cors.New(cors.Options{
 		AllowedOrigins:   []string{"http://localhost:3000"}, // Replace with your frontend URL
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"},
@@ -355,7 +384,7 @@ func login(w http.ResponseWriter, r *http.Request) {
 		Expires:  expirationTime,
 		HttpOnly: true,
 		Secure:   false, // ❗ MUST be false on localhost
-		SameSite: http.SameSiteLaxMode, // Use Lax for GET requests like /me
+		SameSite: http.SameSiteNoneMode, // Use Lax for GET requests like /me
 	}
 	http.SetCookie(w, &cookie)
 	
@@ -425,6 +454,75 @@ func getUsersbyId(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(user)
 }
+func getUserProfile(w http.ResponseWriter, r *http.Request) {
+	userID, err := extractUserIDFromCookie(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var user User
+	query := `SELECT id, username, email, password, role FROM users WHERE id = $1`
+	err = DB.QueryRow(query, userID).Scan(&user.ID, &user.Username, &user.Email, &user.Password, &user.Role)
+	if err != nil {
+		http.Error(w, "Failed to fetch user details", http.StatusInternalServerError)
+		return
+	}
+
+	// Get borrowed books
+	bookQuery := `
+		SELECT b.id, b.title, b.author, b.image, br.borrow_date, br.due_date, br.renewed
+		FROM borrowings br
+		JOIN books b ON br.book_id = b.id
+		WHERE br.user_id = $1 AND br.return_date IS NULL
+	`
+	bookRows, err := DB.Query(bookQuery, userID)
+	if err != nil {
+		http.Error(w, "Failed to fetch borrowed books", http.StatusInternalServerError)
+		return
+	}
+	defer bookRows.Close()
+
+	var books []BorrowedBook
+	for bookRows.Next() {
+		var book BorrowedBook
+		if err := bookRows.Scan(&book.ID, &book.Title, &book.Author, &book.Image, &book.BorrowDate, &book.DueDate, &book.Renewed); err == nil {
+			books = append(books, book)
+		}
+	}
+
+	// Get unpaid fines
+	fineQuery := `
+		SELECT f.id, b.title, f.fine_amount, f.fine_date, f.status
+		FROM fines f
+		JOIN books b ON f.book_id = b.id
+		WHERE f.user_id = $1 AND f.status = 'Unpaid'
+	`
+	fineRows, err := DB.Query(fineQuery, userID)
+	if err != nil {
+		http.Error(w, "Failed to fetch fines", http.StatusInternalServerError)
+		return
+	}
+	defer fineRows.Close()
+
+	var fines []UserFine
+	for fineRows.Next() {
+		var fine UserFine
+		if err := fineRows.Scan(&fine.ID, &fine.BookTitle, &fine.Amount, &fine.Date, &fine.Status); err == nil {
+			fines = append(fines, fine)
+		}
+	}
+
+	profile := map[string]interface{}{
+        "user":          user,
+        "borrowedBooks": books,
+        "fines":         fines,
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(profile)
+}
+
 
 func meHandler(w http.ResponseWriter, r *http.Request) {
 	cookie, err := r.Cookie("token")
@@ -577,17 +675,77 @@ func borrow(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Successfully borrowed book"))
 }
+func getUserBorrowedBooks(w http.ResponseWriter, r *http.Request) {
+    userID, err := extractUserIDFromCookie(r)
+    if err != nil {
+        http.Error(w, "Unauthorized", http.StatusUnauthorized)
+        return
+    }
 
+    query := `
+        SELECT b.id, b.title, b.author, b.image, 
+               br.borrow_date, br.due_date, br.renewed
+        FROM borrowings br
+        JOIN books b ON br.book_id = b.id
+        WHERE br.user_id = $1 AND br.return_date IS NULL
+    `
+    rows, err := DB.Query(query, userID)
+    if err != nil {
+        http.Error(w, "Failed to fetch borrowed books", http.StatusInternalServerError)
+        return
+    }
+    defer rows.Close()
+
+    var books []BorrowedBook
+    for rows.Next() {
+        var book BorrowedBook
+        err := rows.Scan(&book.ID, &book.Title, &book.Author, &book.Image, 
+                         &book.BorrowDate, &book.DueDate, &book.Renewed)
+        if err != nil {
+            log.Printf("Error scanning book row: %v", err)
+            continue
+        }
+        books = append(books, book)
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(books)
+}
 func returning(w http.ResponseWriter, r *http.Request) {
-	idStr := r.PathValue("id")
-	bookId, err := strconv.Atoi(idStr)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
+	userID, err := extractUserIDFromCookie(r)
+    if err != nil {
+        http.Error(w, "Unauthorized", http.StatusUnauthorized)
+        return
+    }
 
+    // Parse book ID from request
+    bookId, err := strconv.Atoi(r.PathValue("id"))
+    if err != nil {
+        http.Error(w, "Invalid book ID", http.StatusBadRequest)
+        return
+    }
+
+    // Check if this user is the one who borrowed the book
+    var borrowingUserID int
+    query := `SELECT user_id FROM borrowings WHERE book_id = $1 AND return_date IS NULL`
+    err = DB.QueryRow(query, bookId).Scan(&borrowingUserID)
+    
+    if err != nil {
+        if err == sql.ErrNoRows {
+            http.Error(w, "No active borrowing record found for this book", http.StatusNotFound)
+        } else {
+            http.Error(w, "Database error", http.StatusInternalServerError)
+        }
+        return
+    }
+
+    // Verify the current user is the borrower
+    if userID != borrowingUserID {
+        http.Error(w, "You can only return books you borrowed", http.StatusForbidden)
+        return
+    }
 	var availability bool
-	query := `SELECT availability FROM books WHERE id = $1`
+	query = `SELECT availability FROM books WHERE id = $1`
 	err = DB.QueryRow(query, bookId).Scan(&availability)
 	if err != nil {
 		http.Error(w, "Failed to check book availability", http.StatusInternalServerError)
@@ -599,7 +757,6 @@ func returning(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Retrieve the due date and user ID for the book borrowing
-	var userID int
 	var dueDate time.Time
 	query = `SELECT user_id, due_date FROM borrowings WHERE book_id = $1 AND return_date IS NULL`
 	err = DB.QueryRow(query, bookId).Scan(&userID, &dueDate)
@@ -667,7 +824,40 @@ func getFines(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(fines)
 }
+func getUserFines(w http.ResponseWriter, r *http.Request) {
+    userID, err := extractUserIDFromCookie(r)
+    if err != nil {
+        http.Error(w, "Unauthorized", http.StatusUnauthorized)
+        return
+    }
 
+    query := `
+        SELECT f.id, b.title, f.fine_amount, f.fine_date, f.status
+        FROM fines f
+        JOIN books b ON f.book_id = b.id
+        WHERE f.user_id = $1 AND f.status = 'Unpaid'
+    `
+    rows, err := DB.Query(query, userID)
+    if err != nil {
+        http.Error(w, "Failed to fetch fines", http.StatusInternalServerError)
+        return
+    }
+    defer rows.Close()
+
+    var fines []UserFine
+    for rows.Next() {
+        var fine UserFine
+        err := rows.Scan(&fine.ID, &fine.BookTitle, &fine.Amount, &fine.Date, &fine.Status)
+        if err != nil {
+            log.Printf("Error scanning fine row: %v", err)
+            continue
+        }
+        fines = append(fines, fine)
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(fines)
+}
 func getFinesUserId(w http.ResponseWriter, r *http.Request) {
 	idStr := r.PathValue("id")
 	id, err := strconv.Atoi(idStr)
@@ -773,4 +963,48 @@ func borrowings(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(borrowings)
+}
+func renewBook(w http.ResponseWriter, r *http.Request) {
+    userID, err := extractUserIDFromCookie(r)
+    if err != nil {
+        http.Error(w, "Unauthorized", http.StatusUnauthorized)
+        return
+    }
+
+    bookID, err := strconv.Atoi(r.PathValue("id"))
+    if err != nil {
+        http.Error(w, "Invalid book ID", http.StatusBadRequest)
+        return
+    }
+
+    // Check if book is already renewed
+    var renewed bool
+    err = DB.QueryRow(
+        "SELECT renewed FROM borrowings WHERE user_id = $1 AND book_id = $2 AND return_date IS NULL",
+        userID, bookID,
+    ).Scan(&renewed)
+    
+    if err != nil {
+        http.Error(w, "Book not found or already returned", http.StatusNotFound)
+        return
+    }
+
+    if renewed {
+        http.Error(w, "Book already renewed", http.StatusBadRequest)
+        return
+    }
+
+    // Update due date (add 14 more days) and mark as renewed
+    _, err = DB.Exec(
+        "UPDATE borrowings SET due_date = due_date + INTERVAL '14 days', renewed = true WHERE user_id = $1 AND book_id = $2",
+        userID, bookID,
+    )
+    
+    if err != nil {
+        http.Error(w, "Failed to renew book", http.StatusInternalServerError)
+        return
+    }
+
+    w.WriteHeader(http.StatusOK)
+    w.Write([]byte("Book renewed successfully"))
 }

@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import localFont from "next/font/local";
 import "./globals.css";
+import { cookies } from "next/headers";
+import { AuthProvider } from "@/context/AuthProvider";
 
 const geistSans = localFont({
   src: "./fonts/GeistVF.woff",
@@ -23,12 +25,17 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const cookieStore = cookies();
+  const token = cookieStore.get("token")?.value;
+  const isLoggedIn = !!token; // Simple check (for SSR)
   return (
     <html lang="en">
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased text-stone-950 bg-stone-100`}
       >
-        {children}
+        <AuthProvider initialAuthState={isLoggedIn}>
+          {children}
+        </AuthProvider>
       </body>
     </html>
   );

@@ -24,6 +24,34 @@ export interface TestBook {
     isLoanedBook?: boolean
 }
 
+export type Profile = {
+  user: {
+    id: number;
+    username: string;
+    email: string;
+    role: string;
+  };
+  borrowedBooks: BorrowedBook[];
+  fines: {
+    id: number;
+    book_title: string;
+    amount: number;
+    date: string;
+    status: string;
+  }[];
+};
+
+export type BorrowedBook = {
+  id: number;
+  title: string;
+  author: string;
+  image: string;
+  borrow_date: string;
+  due_date: string;
+  renewed: boolean;
+};
+
+
 export interface User {
     id: number;
     username: string;
